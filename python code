@@ -1,0 +1,168 @@
+# %%
+# Import libraries
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+import yfinance as yf
+import dash
+from dash import dcc, html, dash_table
+from dash.dependencies import Input, Output
+import plotly.graph_objects as go
+
+# Function to download and preprocess data
+def download_data(stock_symbol, start_date, end_date):
+    data = yf.download(stock_symbol, start=start_date, end=end_date)
+    data['SMA_20'] = data['Close'].rolling(window=20).mean()
+    data['RSI'] = calculate_rsi(data['Close'])
+    data['MACD'], data['Signal'] = calculate_macd(data['Close'])
+    data['Target'] = np.where(data['Close'].shift(-1) > data['Close'], 1, 0)  # Predicting up (1) or down (0)
+    data.dropna(inplace=True)  # Remove rows with NaN values
+    return data
+
+# Function to calculate RSI
+def calculate_rsi(series, period=14):
+    delta = series.diff(1)
+    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+# Function to calculate MACD
+def calculate_macd(series, short_window=12, long_window=26, signal_window=9):
+    short_ema = series.ewm(span=short_window, adjust=False).mean()
+    long_ema = series.ewm(span=long_window, adjust=False).mean()
+    macd = short_ema - long_ema
+    signal = macd.ewm(span=signal_window, adjust=False).mean()
+    return macd, signal
+
+# Train machine learning model
+def train_model(data):
+    features = ['SMA_20', 'RSI', 'MACD', 'Signal']
+    X = data[features]
+    y = data['Target']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    predictions = model.predict(X_test)
+    accuracy = accuracy_score(y_test, predictions)
+    print("Model Accuracy:", accuracy)
+    print(classification_report(y_test, predictions))
+    return model, accuracy
+
+# Create Dash app
+app = dash.Dash(__name__)
+
+# Layout
+app.layout = html.Div([
+    html.H1("Stock Price Movement Prediction"),
+    html.Div([
+        html.Label("Stock Symbol:"),
+        dcc.Input(id='stock-symbol', value='AAPL', type='text'),
+        html.Label("Start Date:"),
+        dcc.Input(id='start-date', value='2020-01-01', type='text'),
+        html.Label("End Date:"),
+        dcc.Input(id='end-date', value='2023-01-01', type='text'),
+        html.Button("Predict", id='predict-button', n_clicks=0)
+    ]),
+    dcc.Graph(id='price-chart'),
+    html.Div(id='prediction-output'),
+    html.H2("Prediction Data"),
+    dash_table.DataTable(
+        id='data-table',
+        columns=[
+            {"name": "Date", "id": "Date"},
+            {"name": "Close", "id": "Close"},
+            {"name": "Target (Next Day)", "id": "Target"},
+            {"name": "Prediction", "id": "Prediction"}
+        ],
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'center'},
+        page_size=10  # Show 10 rows at a time
+    )
+])
+
+# Update callback
+@app.callback(
+    [Output('price-chart', 'figure'),
+     Output('prediction-output', 'children'),
+     Output('data-table', 'data')],
+    [Input('predict-button', 'n_clicks')],
+    [dash.dependencies.State('stock-symbol', 'value'),
+     dash.dependencies.State('start-date', 'value'),
+     dash.dependencies.State('end-date', 'value')]
+)
+def update_prediction(n_clicks, stock_symbol, start_date, end_date):
+    if n_clicks > 0:
+        data = download_data(stock_symbol, start_date, end_date)
+        model, accuracy = train_model(data)  # Original accuracy from test data
+        predictions = model.predict(data[['SMA_20', 'RSI', 'MACD', 'Signal']])
+        data['Prediction'] = predictions
+        data['Prediction'] = data['Prediction'].shift(1)  # Align predictions to the next day
+
+        # Filter data to only include points visible on the graph
+        graph_data = data.dropna().reset_index()
+
+        # Calculate graph-based accuracy
+        correct_predictions = (graph_data['Prediction'] == graph_data['Target']).sum()
+        total_predictions = len(graph_data['Prediction'])
+        graph_accuracy = correct_predictions / total_predictions
+
+        # Fetch the latest RSI and MACD values
+        latest_rsi = data['RSI'].iloc[-1]
+        latest_macd = data['MACD'].iloc[-1]
+
+        # Add one-word explanations
+        rsi_explanation = "Overbought" if latest_rsi > 70 else "Oversold" if latest_rsi < 30 else "Neutral"
+        macd_explanation = "Bullish" if latest_macd > 0 else "Bearish"
+
+        fig = go.Figure()
+
+        # Plot close price
+        fig.add_trace(go.Scatter(x=graph_data['Date'], y=graph_data['Close'], mode='lines', name='Close Price'))
+
+        # Plot predictions for "Up"
+        fig.add_trace(go.Scatter(
+            x=graph_data['Date'][graph_data['Prediction'] == 1],
+            y=graph_data['Close'][graph_data['Prediction'] == 1],
+            mode='markers',
+            name='Predicted Up',
+            marker=dict(color='green', symbol='triangle-up', size=10)
+        ))
+
+        # Plot predictions for "Down"
+        fig.add_trace(go.Scatter(
+            x=graph_data['Date'][graph_data['Prediction'] == 0],
+            y=graph_data['Close'][graph_data['Prediction'] == 0],
+            mode='markers',
+            name='Predicted Down',
+            marker=dict(color='red', symbol='triangle-down', size=10)
+        ))
+
+        fig.update_layout(title=f"Stock Predictions for {stock_symbol}",
+                          xaxis_title='Date',
+                          yaxis_title='Price',
+                          legend=dict(orientation="h"))
+
+        # Include graph-based accuracy, RSI, and MACD details in the output
+        output_text = (f"Model Accuracy (Graph Data): {graph_accuracy:.2f}\n"
+                       f"Latest RSI: {latest_rsi:.2f} ({rsi_explanation})\n"
+                       f"Latest MACD: {latest_macd:.2f} ({macd_explanation})")
+
+        # Prepare data for the data table
+        table_data = graph_data[['Date', 'Close', 'Target', 'Prediction']].tail(10).to_dict('records')
+
+        return fig, output_text, table_data
+
+    return go.Figure(), "Enter details and click Predict", []
+
+
+
+# Run app
+if __name__ == '__main__':
+    app.run_server(debug=True)
+
+print ("http://127.0.0.1:8050/")
+
